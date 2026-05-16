@@ -99,11 +99,11 @@ class Service(object):
         self.client_ip = None
         self.connected = False
 
-        if self.core.started:
-            try:
-                self.core.stop()
-            except RuntimeError:
-                pass
+        #if self.core.started:
+        #    try:
+        #        self.core.stop()
+        #    except RuntimeError:
+        #        pass
 
         return self.response()
 
