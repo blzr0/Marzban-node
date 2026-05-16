@@ -69,7 +69,7 @@ class XrayService(rpyc.Service):
             logger.warning(f'Disconnected from {self.connection.peer}')
 
             #if self.core is not None:
-                #self.core.stop()
+            #    self.core.stop()
 
             #self.core = None
             self.connection = None
