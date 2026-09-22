@@ -90,6 +90,5 @@ jobs:
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/blzr0/marzban-node:${{ github.ref_name }} \
             -t ghcr.io/blzr0/marzban-node:latest \
             $(printf 'ghcr.io/blzr0/marzban-node@sha256:%s ' *)
