@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from typing import Optional
 from uuid import UUID, uuid4
 
 from fastapi import (APIRouter, Body, FastAPI, HTTPException, Request,
@@ -44,6 +45,13 @@ class Service(object):
         self.core_version = self.core.get_version()
         self.config = None
 
+        # Opaque fingerprint of the config the running Xray was started with
+        # (sent by the panel, users excluded), and the panel IP it was started
+        # for. Lets a reconnecting panel attach to a healthy core instead of
+        # restarting it - see response().
+        self.config_fingerprint = None
+        self.started_peer_ip = None
+
         if SERVICE_PROTOCOL == "rest":
             serve_status_over_unix_socket(NODE_STATUS_SOCKET_PATH, self.status)
 
@@ -66,11 +74,25 @@ class Service(object):
             )
         return True
 
+    def attachable_fingerprint(self):
+        """The running config's fingerprint, but only if the current client
+        could use the core as-is. XRayConfig bakes the panel's IP into the
+        API routing rule at start, so a panel connecting from another IP
+        can't reach Xray's API without a restart - report nothing then, and
+        the panel falls back to a normal restart.
+        """
+        if not self.core.started or not self.config_fingerprint:
+            return None
+        if self.client_ip != self.started_peer_ip:
+            return None
+        return self.config_fingerprint
+
     def response(self, **kwargs):
         return {
             "connected": self.connected,
             "started": self.core.started,
             "core_version": self.core_version,
+            "config_fingerprint": self.attachable_fingerprint(),
             **kwargs
         }
 
@@ -90,13 +112,11 @@ class Service(object):
         self.client_ip = request.client.host
 
         if self.connected:
+            # Only control moves to the new client - the core keeps running.
+            # A reconnecting panel (restart, network blip) decides via
+            # config_fingerprint whether it needs a restart at all.
             logger.warning(
                 f'New connection from {self.client_ip}, Core control access was taken away from previous client.')
-            if self.core.started:
-                try:
-                    self.core.stop()
-                except RuntimeError:
-                    pass
 
         self.connected = True
         logger.info(f'{self.client_ip} connected, Session ID = "{self.session_id}".')
@@ -125,8 +145,10 @@ class Service(object):
         self.match_session_id(session_id)
         return {}
 
-    def start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True)):
+    def start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
+              config_fingerprint: Optional[str] = Body(None, embed=True)):
         self.match_session_id(session_id)
+        self.config_fingerprint = None
 
         try:
             config = XRayConfig(config, self.client_ip)
@@ -168,6 +190,8 @@ class Service(object):
                 detail=last_log
             )
 
+        self.config_fingerprint = config_fingerprint
+        self.started_peer_ip = self.client_ip
         return self.response()
 
     def stop(self, session_id: UUID = Body(embed=True)):
@@ -179,10 +203,13 @@ class Service(object):
         except RuntimeError:
             pass
 
+        self.config_fingerprint = None
         return self.response()
 
-    def restart(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True)):
+    def restart(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
+              config_fingerprint: Optional[str] = Body(None, embed=True)):
         self.match_session_id(session_id)
+        self.config_fingerprint = None
 
         try:
             config = XRayConfig(config, self.client_ip)
@@ -224,6 +251,8 @@ class Service(object):
                 detail=last_log
             )
 
+        self.config_fingerprint = config_fingerprint
+        self.started_peer_ip = self.client_ip
         return self.response()
 
     async def logs(self, websocket: WebSocket):
