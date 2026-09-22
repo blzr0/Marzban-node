@@ -20,3 +20,9 @@ DEBUG = config("DEBUG", cast=bool, default=False)
 SERVICE_PROTOCOL = config('SERVICE_PROTOCOL', cast=str, default='rest')
 
 INBOUNDS = config("INBOUNDS", cast=lambda v: [x.strip() for x in v.split(',')] if v else [], default="")
+
+# Local-only diagnostic status socket (used by cli.py). Unix domain socket,
+# not part of the mTLS-protected SERVICE_PORT: reading it already requires
+# the same filesystem access as docker exec-ing into the node, so no extra
+# auth is layered on top of it.
+NODE_STATUS_SOCKET_PATH = config("NODE_STATUS_SOCKET_PATH", default="/var/run/marzban-node/status.sock")

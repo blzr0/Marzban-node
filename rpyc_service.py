@@ -4,8 +4,10 @@ from threading import Thread
 
 import rpyc
 
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH
+from config import (NODE_STATUS_SOCKET_PATH, SERVICE_PROTOCOL,
+                    XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH)
 from logger import logger
+from status_socket import serve_status_over_unix_socket
 from xray import XRayConfig, XRayCore
 
 
@@ -45,6 +47,9 @@ class XrayService(rpyc.Service):
     def __init__(self):
         self.core = None
         self.connection = None
+
+        if SERVICE_PROTOCOL == "rpyc":
+            serve_status_over_unix_socket(NODE_STATUS_SOCKET_PATH, self.status)
 
     def on_connect(self, conn):
         if self.connection:
@@ -111,6 +116,8 @@ class XrayService(rpyc.Service):
             self.core.start(config)
         except Exception as exc:
             logger.error(exc)
+            if self.core:
+                self.core.last_error = str(exc)
             raise exc
 
     @rpyc.exposed
@@ -125,7 +132,7 @@ class XrayService(rpyc.Service):
     @rpyc.exposed
     def restart(self, config: str):
         config = XRayConfig(config, self.connection.peer)
-        self.core.restart(config)
+        self.core.restart(config, reason="panel_requested")
 
     @rpyc.exposed
     def fetch_xray_version(self):
@@ -141,3 +148,22 @@ class XrayService(rpyc.Service):
             logs.exposed_stop = logs.stop
             logs.exposed_cast = logs.cast
             return logs
+
+    @rpyc.exposed
+    def status(self) -> dict:
+        """Diagnostic snapshot of the running Xray process. Deliberately
+        doesn't depend on self.connection - so it also works for a locally
+        run CLI (see cli.py) that isn't the panel's control connection, e.g.
+        while the panel is offline/unreachable.
+        """
+        if self.core is None:
+            return {
+                "xray_running": False,
+                "xray_pid": None,
+                "xray_uptime_seconds": 0,
+                "listening_sockets": [],
+                "xray_api_reachable": False,
+                "last_restart_reason": None,
+                "last_error": None,
+            }
+        return self.core.get_status()

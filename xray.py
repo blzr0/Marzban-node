@@ -1,8 +1,10 @@
 import atexit
 import json
 import re
+import socket
 import subprocess
 import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 
@@ -108,6 +110,14 @@ class XRayCore:
         self.process = None
         self.restarting = False
 
+        # in-memory snapshot of the config last handed to Xray - config is
+        # only ever fed via stdin, never written to disk, so this is the only
+        # place that remembers what's actually listening (used by get_status())
+        self.inbounds = []
+        self.start_time = None
+        self.last_error = None
+        self.last_restart_reason = None
+
         self._logs_buffer = deque(maxlen=100)
         self._temp_log_buffers = {}
         self._on_start_funcs = []
@@ -205,6 +215,10 @@ class XRayCore:
         self.process.stdin.flush()
         self.process.stdin.close()
 
+        self.inbounds = self._extract_inbounds(config)
+        self.start_time = time.time()
+        self.last_error = None
+
         self.__capture_process_logs()
 
         # execute on start functions
@@ -217,19 +231,22 @@ class XRayCore:
 
         self.process.terminate()
         self.process = None
+        self.inbounds = []
+        self.start_time = None
         logger.warning("Xray core stopped")
 
         # execute on stop functions
         for func in self._on_stop_funcs:
             threading.Thread(target=func).start()
 
-    def restart(self, config: XRayConfig):
+    def restart(self, config: XRayConfig, reason: str = "manual"):
         if self.restarting is True:
             return
 
         self.restarting = True
         try:
             logger.warning("Restarting Xray core...")
+            self.last_restart_reason = reason
             self.stop()
             self.start(config)
         finally:
@@ -242,3 +259,46 @@ class XRayCore:
     def on_stop(self, func: callable):
         self._on_stop_funcs.append(func)
         return func
+
+    @staticmethod
+    def _extract_inbounds(config: XRayConfig) -> list:
+        """Snapshot of what's actually being handed to Xray on this start,
+        for get_status() - the API_INBOUND is internal plumbing, not
+        something an admin cares about when diagnosing a node.
+        """
+        sockets = []
+        for inbound in config.get('inbounds', []) or []:
+            if inbound.get('tag') == 'API_INBOUND':
+                continue
+            network = (inbound.get('streamSettings') or {}).get('network')
+            proto = 'udp' if network == 'hysteria' else 'tcp'
+            sockets.append({
+                "tag": inbound.get('tag'),
+                "proto": proto,
+                "port": inbound.get('port'),
+            })
+        return sockets
+
+    def _check_api_reachable(self, timeout: float = 1.5) -> bool:
+        """Cheap TCP-level reachability probe for Xray's API port. This
+        isn't a real gRPC health check (no grpc/protobuf dependency in this
+        project) - it just confirms something is accepting connections there.
+        """
+        host = XRAY_API_HOST if XRAY_API_HOST not in ("0.0.0.0", "") else "127.0.0.1"
+        try:
+            with socket.create_connection((host, XRAY_API_PORT), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def get_status(self) -> dict:
+        running = self.started
+        return {
+            "xray_running": running,
+            "xray_pid": self.process.pid if running else None,
+            "xray_uptime_seconds": int(time.time() - self.start_time) if running and self.start_time else 0,
+            "listening_sockets": self.inbounds if running else [],
+            "xray_api_reachable": self._check_api_reachable() if running else False,
+            "last_restart_reason": self.last_restart_reason,
+            "last_error": self.last_error,
+        }

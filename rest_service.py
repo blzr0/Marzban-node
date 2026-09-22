@@ -10,8 +10,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH
+from config import (NODE_STATUS_SOCKET_PATH, SERVICE_PROTOCOL,
+                    XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH)
 from logger import logger
+from status_socket import serve_status_over_unix_socket
 from xray import XRayConfig, XRayCore
 
 app = FastAPI()
@@ -42,6 +44,9 @@ class Service(object):
         self.core_version = self.core.get_version()
         self.config = None
 
+        if SERVICE_PROTOCOL == "rest":
+            serve_status_over_unix_socket(NODE_STATUS_SOCKET_PATH, self.status)
+
         self.router.add_api_route("/", self.base, methods=["POST"])
         self.router.add_api_route("/ping", self.ping, methods=["POST"])
         self.router.add_api_route("/connect", self.connect, methods=["POST"])
@@ -49,6 +54,7 @@ class Service(object):
         self.router.add_api_route("/start", self.start, methods=["POST"])
         self.router.add_api_route("/stop", self.stop, methods=["POST"])
         self.router.add_api_route("/restart", self.restart, methods=["POST"])
+        self.router.add_api_route("/status", self.status, methods=["GET"])
 
         self.router.add_websocket_route("/logs", self.logs)
 
@@ -70,6 +76,14 @@ class Service(object):
 
     def base(self):
         return self.response()
+
+    def status(self):
+        """Diagnostic snapshot of the running Xray process - no session_id
+        check, since this is meant to also work for a locally-run CLI that
+        has no session with the panel (see cli.py). mTLS on this whole app
+        is the only auth gate, same as every other route.
+        """
+        return self.core.get_status()
 
     def connect(self, request: Request):
         self.session_id = uuid4()
@@ -142,6 +156,7 @@ class Service(object):
 
             except Exception as exc:
                 logger.error(f"Failed to start core: {exc}")
+                self.core.last_error = str(exc)
                 raise HTTPException(
                     status_code=503,
                     detail=str(exc)
@@ -181,7 +196,7 @@ class Service(object):
 
         try:
             with self.core.get_logs() as logs:
-                self.core.restart(config)
+                self.core.restart(config, reason="panel_requested")
 
                 start_time = time.time()
                 end_time = start_time + 3
@@ -197,6 +212,7 @@ class Service(object):
 
         except Exception as exc:
             logger.error(f"Failed to restart core: {exc}")
+            self.core.last_error = str(exc)
             raise HTTPException(
                 status_code=503,
                 detail=str(exc)
