@@ -99,7 +99,7 @@ def cli():
 
 
 @cli.command()
-@click.option("--json", "as_json", is_flag=True, default=False, help="Print raw JSON instead of a table.")
+@click.option("-j", "--json", "as_json", is_flag=True, default=False, help="Print raw JSON instead of a table.")
 def status(as_json):
     """Show live Xray process/inbound status for this node."""
     try:
