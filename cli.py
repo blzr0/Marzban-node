@@ -44,32 +44,51 @@ def format_uptime(seconds) -> str:
 
 
 def render_status(data: dict) -> str:
-    lines = ["Marzban-node status", "─" * 34]
+    lines = [click.style("Marzban-node · live status", bold=True), "═" * 38, ""]
 
     if data.get("xray_running"):
+        dot = click.style("●", fg="green")
+        state = click.style("running", fg="green", bold=True)
         lines.append(
-            f"Xray process:         running, pid {data.get('xray_pid')}, "
-            f"uptime {format_uptime(data.get('xray_uptime_seconds'))}"
+            f"  Xray process    {dot}  {state}   "
+            f"pid {data.get('xray_pid')}, uptime {format_uptime(data.get('xray_uptime_seconds'))}"
         )
     else:
-        suffix = f" (last error: {data['last_error']})" if data.get("last_error") else ""
-        lines.append(f"Xray process:         not running{suffix}")
+        dot = click.style("●", fg="red")
+        state = click.style("not running", fg="red", bold=True)
+        suffix = f"  (last error: {data['last_error']})" if data.get("last_error") else ""
+        lines.append(f"  Xray process    {dot}  {state}{suffix}")
 
-    lines.append(f"Xray API:              {'reachable' if data.get('xray_api_reachable') else 'unreachable'}")
+    api_ok = data.get("xray_api_reachable")
+    dot = click.style("●", fg="green" if api_ok else "red")
+    state = click.style(
+        "reachable" if api_ok else "unreachable",
+        fg="green" if api_ok else "red",
+        bold=True,
+    )
+    lines.append(f"  Xray API        {dot}  {state}")
 
     if data.get("last_restart_reason"):
-        lines.append(f"Last restart reason:   {data['last_restart_reason']}")
+        lines.append(f"  Last restart    {data['last_restart_reason']}")
 
     lines.append("")
 
     sockets = data.get("listening_sockets") or []
     if sockets:
-        lines.append("Active inbounds:")
-        lines.append(f"  {'TAG':<12} {'PROTO':<6} {'PORT'}")
+        # Fixed-width padding misaligns PORT the moment a real tag is
+        # longer than the assumed width, so size TAG to the actual data
+        # (with a floor at the header's own width) instead of guessing.
+        tag_width = max([len("TAG")] + [len(str(entry.get("tag"))) for entry in sockets])
+
+        lines.append(click.style("  Active inbounds", bold=True))
+        lines.append("  " + "─" * 36)
+        lines.append(f"  {'TAG':<{tag_width}} {'PROTO':<7} {'PORT'}")
         for entry in sockets:
-            lines.append(f"  {str(entry.get('tag')):<12} {str(entry.get('proto')):<6} {entry.get('port')}")
+            proto = str(entry.get("proto"))
+            proto_colored = click.style(f"{proto:<7}", fg="cyan")
+            lines.append(f"  {str(entry.get('tag')):<{tag_width}} {proto_colored} {entry.get('port')}")
     else:
-        lines.append("Active inbounds: none")
+        lines.append(click.style("  Active inbounds: none", fg="yellow"))
 
     return "\n".join(lines)
 
