@@ -298,6 +298,7 @@ class XRayCore:
             "xray_pid": self.process.pid if running else None,
             "xray_uptime_seconds": int(time.time() - self.start_time) if running and self.start_time else 0,
             "listening_sockets": self.inbounds if running else [],
+            # TCP-level reachability only - not a real gRPC/StatsService call
             "xray_api_reachable": self._check_api_reachable() if running else False,
             "last_restart_reason": self.last_restart_reason,
             "last_error": self.last_error,

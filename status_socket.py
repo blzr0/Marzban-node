@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import socket
@@ -22,7 +23,7 @@ def serve_status_over_unix_socket(socket_path: str, get_status: callable) -> "so
     try:
         directory = os.path.dirname(socket_path)
         if directory:
-            os.makedirs(directory, exist_ok=True)
+            os.makedirs(directory, mode=0o700, exist_ok=True)
     except OSError as exc:
         logger.warning(f"Could not create directory for status socket {socket_path}: {exc}")
         return None
@@ -33,14 +34,29 @@ def serve_status_over_unix_socket(socket_path: str, get_status: callable) -> "so
         pass
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # bind() creates the socket file with whatever the process umask allows,
+    # which is 022 (world-connectable) more often than not - narrow that to
+    # owner-only *before* the file exists, rather than chmod()'ing after
+    # (which would leave a brief window where anyone can connect).
+    old_umask = os.umask(0o177)
     try:
         server.bind(socket_path)
     except OSError as exc:
         logger.warning(f"Could not bind status socket at {socket_path}: {exc}")
         return None
+    finally:
+        os.umask(old_umask)
 
-    os.chmod(socket_path, 0o600)
+    os.chmod(socket_path, 0o600)  # belt-and-suspenders, in case of a odd umask/filesystem
     server.listen(5)
+
+    def cleanup():
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+
+    atexit.register(cleanup)
 
     def accept_loop():
         while True:
