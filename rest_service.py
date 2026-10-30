@@ -145,9 +145,23 @@ class Service(object):
         self.match_session_id(session_id)
         return {}
 
-    def start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
-              config_fingerprint: Optional[str] = Body(None, embed=True)):
-        self.match_session_id(session_id)
+    def _wait_for_core_start(self, logs):
+        """Wait up to 3 seconds for Xray's "started" line, returns the last
+        log line seen (the error detail if Xray didn't come up).
+        """
+        end_time = time.time() + 3
+        last_log = ''
+        while time.time() < end_time:
+            while logs:
+                log = logs.popleft()
+                if log:
+                    last_log = log
+                if f'Xray {self.core_version} started' in log:
+                    return last_log
+            time.sleep(0.1)
+        return last_log
+
+    def _run_core(self, config: str, config_fingerprint: Optional[str], action: str):
         self.config_fingerprint = None
 
         try:
@@ -160,29 +174,24 @@ class Service(object):
                 }
             )
 
-        with self.core.get_logs() as logs:
-            try:
-                self.core.start(config)
+        try:
+            with self.core.get_logs() as logs:
+                # get_logs() is pre-filled with history - drop it so an old
+                # "started" line can't pass for this launch
+                logs.clear()
+                if action == "restart":
+                    self.core.restart(config, reason="panel_requested")
+                else:
+                    self.core.start(config)
+                last_log = self._wait_for_core_start(logs)
 
-                start_time = time.time()
-                end_time = start_time + 3
-                last_log = ''
-                while time.time() < end_time:
-                    while logs:
-                        log = logs.popleft()
-                        if log:
-                            last_log = log
-                        if f'Xray {self.core_version} started' in log:
-                            break
-                    time.sleep(0.1)
-
-            except Exception as exc:
-                logger.error(f"Failed to start core: {exc}")
-                self.core.last_error = str(exc)
-                raise HTTPException(
-                    status_code=503,
-                    detail=str(exc)
-                )
+        except Exception as exc:
+            logger.error(f"Failed to {action} core: {exc}")
+            self.core.last_error = str(exc)
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc)
+            )
 
         if not self.core.started:
             raise HTTPException(
@@ -193,6 +202,11 @@ class Service(object):
         self.config_fingerprint = config_fingerprint
         self.started_peer_ip = self.client_ip
         return self.response()
+
+    def start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
+              config_fingerprint: Optional[str] = Body(None, embed=True)):
+        self.match_session_id(session_id)
+        return self._run_core(config, config_fingerprint, "start")
 
     def stop(self, session_id: UUID = Body(embed=True)):
         self.match_session_id(session_id)
@@ -209,51 +223,7 @@ class Service(object):
     def restart(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
               config_fingerprint: Optional[str] = Body(None, embed=True)):
         self.match_session_id(session_id)
-        self.config_fingerprint = None
-
-        try:
-            config = XRayConfig(config, self.client_ip)
-        except json.decoder.JSONDecodeError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "config": f'Failed to decode config: {exc}'
-                }
-            )
-
-        try:
-            with self.core.get_logs() as logs:
-                self.core.restart(config, reason="panel_requested")
-
-                start_time = time.time()
-                end_time = start_time + 3
-                last_log = ''
-                while time.time() < end_time:
-                    while logs:
-                        log = logs.popleft()
-                        if log:
-                            last_log = log
-                        if f'Xray {self.core_version} started' in log:
-                            break
-                    time.sleep(0.1)
-
-        except Exception as exc:
-            logger.error(f"Failed to restart core: {exc}")
-            self.core.last_error = str(exc)
-            raise HTTPException(
-                status_code=503,
-                detail=str(exc)
-            )
-
-        if not self.core.started:
-            raise HTTPException(
-                status_code=503,
-                detail=last_log
-            )
-
-        self.config_fingerprint = config_fingerprint
-        self.started_peer_ip = self.client_ip
-        return self.response()
+        return self._run_core(config, config_fingerprint, "restart")
 
     async def logs(self, websocket: WebSocket):
         session_id = websocket.query_params.get('session_id')

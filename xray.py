@@ -137,35 +137,20 @@ class XRayCore:
             return m.groups()[0]
 
     def __capture_process_logs(self):
-        def capture_and_debug_log():
-            while self.process:
-                output = self.process.stdout.readline()
-                if output:
-                    output = output.strip()
-                    self._logs_buffer.append(output)
-                    for buf in list(self._temp_log_buffers.values()):
-                        buf.append(output)
+        # bound to this process, not self.process - otherwise a thread from
+        # before a restart would carry on reading the new process's stdout
+        process = self.process
+
+        def capture_logs():
+            for output in process.stdout:
+                output = output.strip()
+                self._logs_buffer.append(output)
+                for buf in list(self._temp_log_buffers.values()):
+                    buf.append(output)
+                if DEBUG:
                     logger.debug(output)
 
-                elif not self.process or self.process.poll() is not None:
-                    break
-
-        def capture_only():
-            while self.process:
-                output = self.process.stdout.readline()
-                if output:
-                    output = output.strip()
-                    self._logs_buffer.append(output)
-                    for buf in list(self._temp_log_buffers.values()):
-                        buf.append(output)
-
-                elif not self.process or self.process.poll() is not None:
-                    break
-
-        if DEBUG:
-            threading.Thread(target=capture_and_debug_log).start()
-        else:
-            threading.Thread(target=capture_only).start()
+        threading.Thread(target=capture_logs, daemon=True).start()
 
     @contextmanager
     def get_logs(self):
@@ -207,7 +192,7 @@ class XRayCore:
             cmd,
             env=self._env,
             stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
             universal_newlines=True
         )
@@ -230,6 +215,12 @@ class XRayCore:
             return
 
         self.process.terminate()
+        # wait for Xray to release its ports before a restart binds them again
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
         self.process = None
         self.inbounds = []
         self.start_time = None
