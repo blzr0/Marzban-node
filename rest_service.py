@@ -1,6 +1,9 @@
 import asyncio
 import json
+import os
+import threading
 import time
+from collections import deque
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -11,13 +14,21 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
-from config import (NODE_STATUS_SOCKET_PATH, SERVICE_PROTOCOL,
-                    XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH)
+from config import (NODE_STATUS_SOCKET_PATH, PERSIST_CONFIG,
+                    PERSISTED_CONFIG_FILE, SERVICE_PROTOCOL, XRAY_ASSETS_PATH,
+                    XRAY_EXECUTABLE_PATH)
 from logger import logger
 from status_socket import serve_status_over_unix_socket
 from xray import XRayConfig, XRayCore
 
 app = FastAPI()
+
+# How long the panel may stay silent (it pings every ~10s) before the node
+# restarts a dead Xray by itself. While the panel is around it restarts the
+# core with fresh users; the node only has the users of the last start.
+PANEL_GRACE_SECONDS = 30
+# Watchdog gives up after this many restarts within a minute (broken config)
+WATCHDOG_MAX_RESTARTS = 5
 
 
 @app.exception_handler(RequestValidationError)
@@ -52,8 +63,24 @@ class Service(object):
         self.config_fingerprint = None
         self.started_peer_ip = None
 
+        # serializes everything that starts/stops Xray (panel requests run in
+        # a thread pool, the watchdog in its own thread)
+        self._core_lock = threading.Lock()
+        self._panel_seen = None
+        # {"config", "peer_ip", "fingerprint"} of the last panel start
+        self._saved = None
+        self._watchdog_starts = deque(maxlen=WATCHDOG_MAX_RESTARTS)
+        self._watchdog_gave_up = False
+
         if SERVICE_PROTOCOL == "rest":
             serve_status_over_unix_socket(NODE_STATUS_SOCKET_PATH, self.status)
+
+            if PERSIST_CONFIG:
+                self._saved = self._load_saved_config()
+                if self._saved:
+                    with self._core_lock:
+                        self._start_saved("autostart")
+                threading.Thread(target=self._watchdog, daemon=True).start()
 
         self.router.add_api_route("/", self.base, methods=["POST"])
         self.router.add_api_route("/ping", self.ping, methods=["POST"])
@@ -72,6 +99,7 @@ class Service(object):
                 status_code=403,
                 detail="Session ID mismatch."
             )
+        self._panel_seen = time.time()
         return True
 
     def attachable_fingerprint(self):
@@ -119,6 +147,7 @@ class Service(object):
                 f'New connection from {self.client_ip}, Core control access was taken away from previous client.')
 
         self.connected = True
+        self._panel_seen = time.time()
         logger.info(f'{self.client_ip} connected, Session ID = "{self.session_id}".')
 
         return self.response(
@@ -162,10 +191,14 @@ class Service(object):
         return last_log
 
     def _run_core(self, config: str, config_fingerprint: Optional[str], action: str):
+        with self._core_lock:
+            return self._run_core_locked(config, config_fingerprint, action)
+
+    def _run_core_locked(self, raw_config: str, config_fingerprint: Optional[str], action: str):
         self.config_fingerprint = None
 
         try:
-            config = XRayConfig(config, self.client_ip)
+            config = XRayConfig(raw_config, self.client_ip)
         except json.decoder.JSONDecodeError as exc:
             raise HTTPException(
                 status_code=422,
@@ -201,7 +234,103 @@ class Service(object):
 
         self.config_fingerprint = config_fingerprint
         self.started_peer_ip = self.client_ip
+        self._save_config(raw_config, self.client_ip, config_fingerprint)
         return self.response()
+
+    def _load_saved_config(self):
+        try:
+            with open(PERSISTED_CONFIG_FILE) as f:
+                saved = json.load(f)
+            saved["config"], saved["peer_ip"]
+            return saved
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning(f"Ignoring unreadable saved config {PERSISTED_CONFIG_FILE}: {exc}")
+            return None
+
+    def _save_config(self, raw_config: str, peer_ip: str, config_fingerprint: Optional[str]):
+        if not PERSIST_CONFIG:
+            return
+
+        self._saved = {"config": raw_config, "peer_ip": peer_ip, "fingerprint": config_fingerprint}
+        self._watchdog_starts.clear()
+        self._watchdog_gave_up = False
+
+        tmp = PERSISTED_CONFIG_FILE + ".tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self._saved, f)
+            os.replace(tmp, PERSISTED_CONFIG_FILE)
+        except OSError as exc:
+            logger.warning(f"Failed to save config to {PERSISTED_CONFIG_FILE}: {exc}")
+
+    def _forget_config(self):
+        self._saved = None
+        try:
+            os.remove(PERSISTED_CONFIG_FILE)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(f"Failed to remove {PERSISTED_CONFIG_FILE}: {exc}")
+
+    def _start_saved(self, reason: str):
+        """Start Xray from the last panel config, without the panel. Caller
+        holds _core_lock. Restores the panel's fingerprint and IP, so the
+        panel attaches on reconnect and syncs the users changed meanwhile.
+        """
+        saved = self._saved
+        crash_error = self.core.last_error
+        logger.warning(f"Starting Xray from the saved config ({reason})")
+        try:
+            config = XRayConfig(saved["config"], saved["peer_ip"])
+            with self.core.get_logs() as logs:
+                logs.clear()
+                self.core.start(config)
+                last_log = self._wait_for_core_start(logs)
+        except Exception as exc:
+            logger.error(f"Failed to start Xray from the saved config: {exc}")
+            self.core.last_error = str(exc)
+            return
+
+        if not self.core.started:
+            logger.error(f"Failed to start Xray from the saved config: {last_log}")
+            return
+
+        self.core.last_restart_reason = reason
+        # keep why it went down visible in `cli.py status`
+        self.core.last_error = crash_error
+        self.config_fingerprint = saved.get("fingerprint")
+        self.started_peer_ip = saved["peer_ip"]
+
+    def _watchdog(self):
+        while True:
+            time.sleep(2)
+            try:
+                self._watchdog_check()
+            except Exception as exc:
+                logger.error(f"Watchdog: {exc}")
+
+    def _watchdog_check(self):
+        if self.core.started or not self._saved or self._watchdog_gave_up:
+            return
+        if self._panel_seen and time.time() - self._panel_seen < PANEL_GRACE_SECONDS:
+            return
+
+        with self._core_lock:
+            if self.core.started or not self._saved:
+                return
+
+            now = time.time()
+            if len(self._watchdog_starts) == WATCHDOG_MAX_RESTARTS and now - self._watchdog_starts[0] < 60:
+                self._watchdog_gave_up = True
+                logger.error(f"Watchdog: Xray failed {WATCHDOG_MAX_RESTARTS} times within a minute, "
+                             "not restarting it until the panel starts it again")
+                return
+            self._watchdog_starts.append(now)
+            self._start_saved("watchdog")
 
     def start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
               config_fingerprint: Optional[str] = Body(None, embed=True)):
@@ -211,11 +340,15 @@ class Service(object):
     def stop(self, session_id: UUID = Body(embed=True)):
         self.match_session_id(session_id)
 
-        try:
-            self.core.stop()
+        with self._core_lock:
+            try:
+                self.core.stop()
 
-        except RuntimeError:
-            pass
+            except RuntimeError:
+                pass
+
+            # stopped on purpose - don't bring it back on the next boot
+            self._forget_config()
 
         self.config_fingerprint = None
         return self.response()

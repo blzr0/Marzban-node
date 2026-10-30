@@ -26,3 +26,10 @@ INBOUNDS = config("INBOUNDS", cast=lambda v: [x.strip() for x in v.split(',')] i
 # the same filesystem access as docker exec-ing into the node, so no extra
 # auth is layered on top of it.
 NODE_STATUS_SOCKET_PATH = config("NODE_STATUS_SOCKET_PATH", default="/var/run/marzban-node/status.sock")
+
+# Last config the panel started Xray with, kept on disk so the node brings
+# Xray back up on its own (container restart, reboot, Xray crash) while the
+# panel is unreachable. Holds user UUIDs and Reality keys - stored 0600 next
+# to the node's SSL key.
+PERSIST_CONFIG = config("PERSIST_CONFIG", cast=bool, default=True)
+PERSISTED_CONFIG_FILE = config("PERSISTED_CONFIG_FILE", default="/var/lib/marzban-node/last_config.json")

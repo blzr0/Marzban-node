@@ -142,13 +142,23 @@ class XRayCore:
         process = self.process
 
         def capture_logs():
+            last_log = ''
             for output in process.stdout:
                 output = output.strip()
+                if output:
+                    last_log = output
                 self._logs_buffer.append(output)
                 for buf in list(self._temp_log_buffers.values()):
                     buf.append(output)
                 if DEBUG:
                     logger.debug(output)
+
+            code = process.wait()
+            # still the current process - nobody stopped or replaced it, so
+            # Xray died on its own (panic, OOM kill, ...)
+            if self.process is process:
+                self.last_error = f"Xray exited unexpectedly (code {code}): {last_log}"
+                logger.error(self.last_error)
 
         threading.Thread(target=capture_logs, daemon=True).start()
 
@@ -214,14 +224,15 @@ class XRayCore:
         if not self.started:
             return
 
-        self.process.terminate()
+        # detached first, so the log thread doesn't take this exit for a crash
+        process, self.process = self.process, None
+        process.terminate()
         # wait for Xray to release its ports before a restart binds them again
         try:
-            self.process.wait(timeout=5)
+            process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
-        self.process = None
+            process.kill()
+            process.wait()
         self.inbounds = []
         self.start_time = None
         logger.warning("Xray core stopped")
